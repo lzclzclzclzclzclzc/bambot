@@ -203,6 +203,43 @@
             <h2>Log Output</h2>
             <pre id="logOutput"></pre>
         </div>
+
+        <!-- Added Batch JSON Playback section -->
+        <div class="section">
+            <h2>Batch JSON Playback</h2>
+            <input type="file" id="jsonFileInput" accept=".json">
+            <button id="playJsonBtn">Play JSON</button>
+            <p>格式示例：<br>
+            <pre>[
+  { "timestamp": 0, "actions": [ { "servoId": 1, "position": 1000 }, { "servoId": 2, "position": 2000 } ] },
+  { "timestamp": 500, "actions": [ { "servoId": 1, "position": 1500 } ] },
+  { "timestamp": 1000, "actions": [ { "servoId": 2, "position": 2500 } ] }
+]</pre>
+            </p>
+        </div>
+
+        <!-- Added AI Prompt section -->
+        <div class="section">
+            <h2>AI动作生成</h2>
+            <label for="aiPromptInput">请输入机器人动作指令（自然语言）:</label>
+            <input type="text" id="aiPromptInput" style="width: 60%;">
+            <button id="runPromptBtn">AI生成动作并运行</button>
+            <span id="aiPromptStatus"></span>
+        </div>
+
+        <!-- 显示生成的json文件 -->
+        <div class="section">
+            <h2>AI生成动作JSON预览</h2>
+            <pre id="aiJsonPreview" style="background:#f4f4f4; padding:10px; border:1px solid #ddd; border-radius:3px; max-height:300px; overflow-y:auto;"></pre>
+        </div>
+
+        <!-- 在页面底部增加录制实时JSON预览框 -->
+        <div class="section">
+            <h2>录制动作实时JSON预览</h2>
+            <pre id="recordJsonPreview" style="background:#f4f4f4; padding:10px; border:1px solid #ddd; border-radius:3px; max-height:300px; overflow-y:auto;"></pre>
+        </div>
+
+        <button id="disableAllTorqueBtn">全部关节断电</button>
     </div>
 
     <script type="module">
@@ -956,6 +993,257 @@
         // Initial log
         log('Test page loaded. Please connect to a servo controller.');
 
+        const jsonFileInput = document.getElementById('jsonFileInput');
+        const playJsonBtn = document.getElementById('playJsonBtn');
+        let jsonActions = [];
+
+        jsonFileInput.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    jsonActions = JSON.parse(evt.target.result);
+                    log('JSON file loaded. Ready to play.');
+                } catch (err) {
+                    log('Error parsing JSON: ' + err.message);
+                }
+            };
+            reader.readAsText(file);
+        };
+
+        playJsonBtn.onclick = async () => {
+            if (!isConnected) { log('Error: Not connected'); return; }
+            if (!jsonActions || jsonActions.length === 0) {
+                log('No JSON actions loaded.');
+                return;
+            }
+            log('Starting JSON playback...');
+            const startTime = Date.now();
+            for (let i = 0; i < jsonActions.length; i++) {
+                const { timestamp, actions } = jsonActions[i];
+                const now = Date.now();
+                const waitTime = timestamp - (now - startTime);
+                if (waitTime > 0) await new Promise(res => setTimeout(res, waitTime));
+                for (const act of actions) {
+                    try {
+                        if (act.position !== undefined) {
+                            await scsServoSDK.writePosition(act.servoId, act.position);
+                            log(`Set servo ${act.servoId} position to ${act.position} at t=${timestamp}`);
+                        }
+                        if (act.speed !== undefined) {
+                            await scsServoSDK.writeWheelSpeed(act.servoId, act.speed);
+                            log(`Set servo ${act.servoId} speed to ${act.speed} at t=${timestamp}`);
+                        }
+                        if (act.correction !== undefined) {
+                            await scsServoSDK.writePosCorrection(act.servoId, act.correction);
+                            log(`Set servo ${act.servoId} correction to ${act.correction} at t=${timestamp}`);
+                        }
+                        if (act.maxPosLimit !== undefined) {
+                            await scsServoSDK.writeMaxPosLimit(act.servoId, act.maxPosLimit);
+                            log(`Set servo ${act.servoId} maxPosLimit to ${act.maxPosLimit} at t=${timestamp}`);
+                        }
+                        if (act.minPosLimit !== undefined) {
+                            await scsServoSDK.writeMinPosLimit(act.servoId, act.minPosLimit);
+                            log(`Set servo ${act.servoId} minPosLimit to ${act.minPosLimit} at t=${timestamp}`);
+                        }
+                        // 可继续扩展其它参数
+                    } catch (err) {
+                        log(`Error at t=${timestamp}: ${err.message}`);
+                    }
+                }
+            }
+            log('JSON playback finished.');
+        };
+
+        const aiPromptInput = document.getElementById("aiPromptInput");
+        const runPromptBtn = document.getElementById("runPromptBtn");
+        const aiPromptStatus = document.getElementById("aiPromptStatus");
+        const aiJsonPreview = document.getElementById("aiJsonPreview");
+
+        async function getJsonFromPrompt(prompt) {
+            try {
+                const resp = await fetch("http://localhost:5000/generate_json", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ prompt })
+                });
+                const data = await resp.json();
+                if (data.json) {
+                    return JSON.parse(data.json);
+                } else {
+                    log("后端生成失败: " + data.error);
+                    return null;
+                }
+            } catch (err) {
+                log("网络请求失败: " + err.message);
+                return null;
+            }
+        }
+
+        runPromptBtn.onclick = async () => {
+            const prompt = aiPromptInput.value.trim();
+            if (!prompt) {
+                aiPromptStatus.textContent = "请输入指令";
+                aiPromptStatus.style.color = "red";
+                return;
+            }
+            aiPromptStatus.textContent = "正在请求大模型生成动作...";
+            aiPromptStatus.style.color = "black";
+            log("正在请求大模型生成动作...");
+
+            // 自动读取所有电机位置（假设ID为1~6，可根据实际情况调整）
+            const allServoIds = [1, 2, 3, 4, 5, 6];
+            let positions = {};
+            try {
+                const posMap = await scsServoSDK.syncReadPositions(allServoIds);
+                posMap.forEach((pos, id) => {
+                    positions[id] = pos;
+                });
+            } catch (err) {
+                aiPromptStatus.textContent = "读取电机位置失败";
+                aiPromptStatus.style.color = "red";
+                log("读取电机位置失败: " + err.message);
+                return;
+            }
+            log("电机位置已读取: " + JSON.stringify(positions));
+
+            // 发送prompt和positions到后端
+            let jsonActions = null;
+            try {
+                const resp = await fetch("http://localhost:5000/generate_json", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ prompt, positions })
+                });
+                const data = await resp.json();
+                if (data.json) {
+                    jsonActions = JSON.parse(data.json);
+                } else {
+                    aiPromptStatus.textContent = "生成失败";
+                    aiPromptStatus.style.color = "red";
+                    aiJsonPreview.textContent = "";
+                    log("后端生成失败: " + data.error);
+                    return;
+                }
+            } catch (err) {
+                aiPromptStatus.textContent = "网络请求失败";
+                aiPromptStatus.style.color = "red";
+                log("网络请求失败: " + err.message);
+                return;
+            }
+            aiPromptStatus.textContent = "动作JSON已生成，开始运行...";
+            aiPromptStatus.style.color = "green";
+            log("动作JSON已生成，开始运行...");
+            // 显示生成的 JSON 文件
+            aiJsonPreview.textContent = JSON.stringify(jsonActions, null, 2);
+
+            const startTime = Date.now();
+            for (let i = 0; i < jsonActions.length; i++) {
+                const { timestamp, actions } = jsonActions[i];
+                const now = Date.now();
+                const waitTime = timestamp - (now - startTime);
+                if (waitTime > 0) await new Promise(res => setTimeout(res, waitTime));
+                for (const act of actions) {
+                    try {
+                        if (act.position !== undefined) await scsServoSDK.writePosition(act.servoId, act.position);
+                        if (act.speed !== undefined) await scsServoSDK.writeWheelSpeed(act.servoId, act.speed);
+                        if (act.correction !== undefined) await scsServoSDK.writePosCorrection(act.servoId, act.correction);
+                        if (act.maxPosLimit !== undefined) await scsServoSDK.writeMaxPosLimit(act.servoId, act.maxPosLimit);
+                        if (act.minPosLimit !== undefined) await scsServoSDK.writeMinPosLimit(act.servoId, act.minPosLimit);
+                    } catch (err) {
+                        log(`Error at t=${timestamp}: ${err.message}`);
+                    }
+                }
+            }
+            aiPromptStatus.textContent = "动作运行完成";
+            aiPromptStatus.style.color = "green";
+            log('JSON playback finished.');
+        }
+
+        const recordBtn = document.createElement("button");
+        recordBtn.textContent = "开始录制";
+        const stopBtn = document.createElement("button");
+        stopBtn.textContent = "停止录制";
+        const saveBtn = document.createElement("button");
+        saveBtn.textContent = "保存为JSON";
+        document.querySelector(".container").appendChild(recordBtn);
+        document.querySelector(".container").appendChild(stopBtn);
+        document.querySelector(".container").appendChild(saveBtn);
+
+        let isRecording = false;
+        let recordStartTime = 0;
+        let recordData = [];
+        let recordTimer = null;
+
+        const recordJsonPreview = document.getElementById("recordJsonPreview");
+
+        recordBtn.onclick = () => {
+            if (!isConnected) { log('Error: Not connected'); return; }
+            isRecording = true;
+            recordStartTime = Date.now();
+            recordData = [];
+            log("开始录制动作...");
+            recordJsonPreview.textContent = ""; // 清空预览
+            recordTimer = setInterval(async () => {
+                const allServoIds = [1,2,3,4,5,6]; // 根据实际情况调整
+                try {
+                    const posMap = await scsServoSDK.syncReadPositions(allServoIds);
+                    let actions = [];
+                    posMap.forEach((pos, id) => {
+                        actions.push({ servoId: id, position: pos });
+                    });
+                    recordData.push({
+                        timestamp: Date.now() - recordStartTime,
+                        actions
+                    });
+                    // 实时更新预览
+                    recordJsonPreview.textContent = JSON.stringify(recordData, null, 2);
+                } catch (err) {
+                    log("录制时读取电机位置失败: " + err.message);
+                }
+            }, 50); // 每50ms记录一次
+        };
+
+        stopBtn.onclick = () => {
+            if (recordTimer) clearInterval(recordTimer);
+            isRecording = false;
+            log("录制结束，共记录 " + recordData.length + " 帧。");
+            // 停止后也保留最后一次预览
+        };
+
+        saveBtn.onclick = () => {
+            if (recordData.length === 0) {
+                log("没有录制数据，无法保存。");
+                return;
+            }
+            const jsonStr = JSON.stringify(recordData, null, 2);
+            const blob = new Blob([jsonStr], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "robot_record.json";
+            a.click();
+            URL.revokeObjectURL(url);
+            log("动作JSON已保存。");
+        };
+
+        const disableAllTorqueBtn = document.getElementById("disableAllTorqueBtn");
+
+        disableAllTorqueBtn.onclick = async () => {
+            if (!isConnected) { log('Error: Not connected'); return; }
+            const allServoIds = [1, 2, 3, 4, 5, 6];
+            log("正在断开所有关节扭矩...");
+            try {
+                for (const id of allServoIds) {
+                    await scsServoSDK.writeTorqueEnable(id, false);
+                    log(`已断开关节 ${id} 扭矩`);
+                }
+                log("全部关节已断电完成。");
+            } catch (err) {
+                log("断开关节扭矩失败: " + err.message);
+            }
+        };
     </script>
 </body>
 </html>
